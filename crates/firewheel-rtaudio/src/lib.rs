@@ -273,6 +273,14 @@ impl ErrorCallbackSingleton {
 /// An error occurred while trying to start a CPAL audio stream.
 #[derive(Debug, thiserror::Error)]
 pub enum StartStreamError {
+    #[error("Processor {node:?} refused stream preparation: {error}")]
+    StreamPreparationFailed {
+        node: firewheel_core::node::NodeID,
+        #[source]
+        error: firewheel_core::node::NodeError,
+    },
+    #[error("The context to processor message channel is full")]
+    MsgChannelFull,
     /// The Firewheel context is already active. Either it has never been activated
     /// or the [`FirewheelProcessor`] counterpart has not been dropped yet.
     ///
@@ -294,6 +302,10 @@ impl From<ActivateError> for StartStreamError {
         match e {
             ActivateError::AlreadyActive => Self::AlreadyActive,
             ActivateError::GraphCompileError(e) => Self::GraphCompileError(e),
+            ActivateError::StreamPreparationFailed { node, error } => {
+                Self::StreamPreparationFailed { node, error }
+            }
+            ActivateError::MsgChannelFull => Self::MsgChannelFull,
         }
     }
 }

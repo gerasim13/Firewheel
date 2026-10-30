@@ -58,24 +58,15 @@ impl NodeError {
     }
 }
 
-impl<E> From<E> for NodeError
-where
-    E: Error + 'static,
-{
-    fn from(err: E) -> Self {
-        NodeError(Box::new(err))
-    }
-}
-
 impl fmt::Display for NodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Node Error: {}", self.0)
     }
 }
 
-impl From<NodeError> for Box<dyn Error> {
-    fn from(value: NodeError) -> Self {
-        value.0
+impl Error for NodeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.0.as_ref())
     }
 }
 
@@ -252,9 +243,9 @@ pub struct AudioNodeInfoInner {
 ///    7a. The Firewheel processor calls [`AudioNodeProcessor::stream_stopped`].
 ///    The processor is then sent back to the main thread.
 ///
-///    7b. If a new audio stream is started, then the context will call
-///    [`AudioNodeProcessor::new_stream`] on the main thread, and then send the
-///    processor back to the audio thread for processing.
+///    7b. For a new stream the context prepares every retained processor on the
+///    main thread. Only after all preparation succeeds does it call
+///    [`AudioNodeProcessor::new_stream`] and return processors to the audio thread.
 ///
 ///    7c. If the Firewheel context is dropped before a new stream is started, then
 ///    both the node and the processor counterpart are dropped on the main thread.
@@ -552,8 +543,19 @@ pub trait AudioNodeProcessor: 'static + Send {
         let _ = context;
     }
 
-    /// Called when a new audio stream has been started after a previous
-    /// call to [`AudioNodeProcessor::stream_stopped`].
+    /// Prepare a retained processor for the actual negotiated stream, on the main thread.
+    ///
+    /// Only private staging may change. Refusal leaves active state unchanged and
+    /// invalidates this attempt's commit marker. Every later attempt prepares again,
+    /// including processors that were constructed but never processed audio.
+    fn prepare_new_stream(&mut self, stream_info: &StreamInfo) -> Result<(), NodeError> {
+        let _ = stream_info;
+        Ok(())
+    }
+
+    /// Commit a successful preparation for a retained processor on the main thread.
+    /// This can follow construction on an earlier attempt without a prior callback.
+    /// Fresh construction for this attempt receives no extra initial commit.
     ///
     /// This method gets called on the main thread, not the realtime audio
     /// thread. So it is safe to allocate/deallocate here.
@@ -580,6 +582,9 @@ impl AudioNodeProcessor for Box<dyn AudioNodeProcessor> {
     }
     fn stream_stopped(&mut self, context: &mut ProcStreamCtx) {
         self.as_mut().stream_stopped(context)
+    }
+    fn prepare_new_stream(&mut self, stream_info: &StreamInfo) -> Result<(), NodeError> {
+        self.as_mut().prepare_new_stream(stream_info)
     }
     fn new_stream(&mut self, stream_info: &StreamInfo, context: &mut ProcStreamCtx) {
         self.as_mut().new_stream(stream_info, context)
@@ -1162,5 +1167,35 @@ impl<'a, S: Send + 'static> ProcStoreEntry<'a, S> {
             boxed_entry: entry,
             type_: PhantomData,
         }
+    }
+}
+
+#[cfg(test)]
+mod node_error_tests {
+    use super::*;
+
+    #[derive(Debug, PartialEq)]
+    struct Payload(u32);
+
+    impl fmt::Display for Payload {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "payload {}", self.0)
+        }
+    }
+
+    impl Error for Payload {}
+
+    #[test]
+    fn source_and_standard_box_conversion_keep_the_original_payload() {
+        let payload = Box::new(Payload(17));
+        let pointer = core::ptr::from_ref(payload.as_ref());
+        let error = NodeError::from_boxed(payload);
+        let source = error.source().unwrap().downcast_ref::<Payload>().unwrap();
+        assert!(core::ptr::eq(source, pointer));
+        let boxed: Box<dyn Error> = error.into();
+        let carrier = boxed.downcast_ref::<NodeError>().unwrap();
+        let source = carrier.source().unwrap().downcast_ref::<Payload>().unwrap();
+        assert_eq!(source, &Payload(17));
+        assert!(core::ptr::eq(source, pointer));
     }
 }

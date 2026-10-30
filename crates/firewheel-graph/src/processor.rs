@@ -20,7 +20,7 @@ use firewheel_core::{
         declick::{DeclickValues, Declicker},
     },
     event::{NodeEvent, ProcEventsIndex},
-    node::{AudioNodeProcessor, ProcExtra},
+    node::{AudioNodeProcessor, NUM_SCRATCH_BUFFERS, ProcExtra},
 };
 
 use crate::{
@@ -47,6 +47,7 @@ use firewheel_core::clock::{InstantMusical, TransportState};
 
 mod event_scheduler;
 mod handle_messages;
+pub(crate) use handle_messages::{prepare_queue, prepare_schedule};
 mod process;
 pub(crate) mod profiling;
 
@@ -131,6 +132,7 @@ pub(crate) struct FirewheelProcessorInner {
     sample_rate: NonZeroU32,
     sample_rate_recip: f64,
     max_block_frames: usize,
+    prepared_stream: Option<PreparedStream>,
 
     clock_samples: InstantSamples,
     shared_clock_input: triple_buffer::Input<SharedClock>,
@@ -164,21 +166,50 @@ pub(crate) struct FirewheelProcessorConfig {
     pub scheduled_event_buffer_capacity: usize,
 }
 
+struct PreparedStream {
+    scratch: Option<ConstSequentialBuffer<f32, NUM_SCRATCH_BUFFERS>>,
+    declick: Option<DeclickValues>,
+}
+
+pub(crate) struct InitialResources {
+    event_scheduler: EventScheduler,
+    proc_event_queue: Vec<ProcEventsIndex>,
+    scratch: ConstSequentialBuffer<f32, NUM_SCRATCH_BUFFERS>,
+    declick: DeclickValues,
+    #[cfg(feature = "musical_transport")]
+    transport: ProcTransportState,
+}
+
 impl FirewheelProcessorInner {
+    pub(crate) fn prepare_initial(
+        config: &FirewheelProcessorConfig,
+        info: &StreamInfo,
+    ) -> InitialResources {
+        InitialResources {
+            event_scheduler: EventScheduler::new(
+                config.immediate_event_buffer_capacity,
+                #[cfg(feature = "scheduled_events")]
+                config.scheduled_event_buffer_capacity,
+                config.buffer_out_of_space_mode,
+            ),
+            proc_event_queue: Vec::with_capacity(config.node_event_buffer_capacity),
+            scratch: ConstSequentialBuffer::new(info.max_block_frames.get() as usize),
+            declick: DeclickValues::new(info.declick_frames),
+            #[cfg(feature = "musical_transport")]
+            transport: ProcTransportState::new(),
+        }
+    }
     /// Note, this method gets called on the main thread, not the audio thread.
     pub(crate) fn new(
         config: FirewheelProcessorConfig,
         proc_channel: ProcessorChannel,
         stream_info: &StreamInfo,
+        resources: InitialResources,
     ) -> Self {
         let FirewheelProcessorConfig {
             flags,
-            immediate_event_buffer_capacity,
-            buffer_out_of_space_mode,
             clamp_graph_inputs_below_amp,
-            node_event_buffer_capacity,
-            #[cfg(feature = "scheduled_events")]
-            scheduled_event_buffer_capacity,
+            ..
         } = config;
 
         let ProcessorChannel {
@@ -196,31 +227,25 @@ impl FirewheelProcessorInner {
             schedule_data: None,
             from_graph_rx: from_context_rx,
             to_graph_tx: to_context_tx,
-            event_scheduler: EventScheduler::new(
-                immediate_event_buffer_capacity,
-                #[cfg(feature = "scheduled_events")]
-                scheduled_event_buffer_capacity,
-                buffer_out_of_space_mode,
-            ),
-            proc_event_queue: Vec::with_capacity(node_event_buffer_capacity),
+            event_scheduler: resources.event_scheduler,
+            proc_event_queue: resources.proc_event_queue,
             sample_rate: stream_info.sample_rate,
             sample_rate_recip: stream_info.sample_rate_recip,
             max_block_frames: stream_info.max_block_frames.get() as usize,
+            prepared_stream: None,
             clock_samples: InstantSamples(0),
             shared_clock_input,
             profiler_tx,
             #[cfg(feature = "musical_transport")]
-            proc_transport_state: ProcTransportState::new(),
+            proc_transport_state: resources.transport,
             flags,
             shared_flags,
             clamp_graph_inputs_below_amp,
             last_input_overflow_log_instant: None,
             last_output_underflow_log_instant: None,
             extra: ProcExtra {
-                scratch_buffers: ConstSequentialBuffer::new(
-                    stream_info.max_block_frames.get() as usize
-                ),
-                declick_values: DeclickValues::new(stream_info.declick_frames),
+                scratch_buffers: resources.scratch,
+                declick_values: resources.declick,
                 logger,
                 store,
             },

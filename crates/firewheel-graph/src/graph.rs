@@ -1,9 +1,8 @@
 use core::any::Any;
 use core::fmt::Debug;
 use core::hash::Hash;
+use core::num::NonZeroU32;
 
-#[cfg(not(feature = "std"))]
-use alloc::string::ToString;
 #[cfg(not(feature = "std"))]
 use bevy_platform::prelude::{Box, Vec};
 
@@ -27,6 +26,7 @@ pub(crate) use self::compiler::{
     CompiledSchedule, NodeHeapData, ProcessNodeInfo, ScheduleHeapData,
 };
 
+use self::compiler::Construction;
 pub use self::compiler::{Edge, EdgeID, NodeEntry, PortIdx};
 
 mod compiler;
@@ -57,6 +57,7 @@ pub(crate) struct AudioGraph {
 
     prev_node_arena_capacity: usize,
     prev_buffer_capacity: usize,
+    prev_max_block_frames: Option<NonZeroU32>,
 
     modify_guard_stack: Vec<ModifyGraphGuard>,
 }
@@ -118,6 +119,7 @@ impl AudioGraph {
             nodes_to_call_update_method: Vec::new(),
             prev_node_arena_capacity: 0,
             prev_buffer_capacity: 0,
+            prev_max_block_frames: None,
             modify_guard_stack: Vec::new(),
         }
     }
@@ -137,9 +139,7 @@ impl AudioGraph {
 
         if !restore_prev_state {
             for node_entry in guard.removed_nodes.drain(..) {
-                self.nodes_to_remove_from_schedule.push(node_entry.id);
-                self.active_nodes_to_remove
-                    .insert(node_entry.id, node_entry);
+                self.retire_entry(node_entry);
             }
 
             return;
@@ -293,11 +293,17 @@ impl AudioGraph {
         if !is_restoring_graph_state && let Some(guard) = self.modify_guard_stack.last_mut() {
             guard.removed_nodes.push(node_entry);
         } else {
-            self.nodes_to_remove_from_schedule.push(node_id);
-            self.active_nodes_to_remove.insert(node_id, node_entry);
+            self.retire_entry(node_entry);
         }
 
         Ok(removed_edges)
+    }
+
+    fn retire_entry(&mut self, entry: NodeEntry) {
+        if matches!(entry.construction, Construction::Transferred) {
+            self.nodes_to_remove_from_schedule.push(entry.id);
+            self.active_nodes_to_remove.insert(entry.id, entry);
+        }
     }
 
     /// Get information about a node in the graph.
@@ -658,15 +664,55 @@ impl AudioGraph {
         self.needs_compile
     }
 
-    pub(crate) fn on_schedule_send_failed(&mut self, failed_schedule: Box<ScheduleHeapData>) {
-        self.needs_compile = true;
-        self.prev_buffer_capacity = 0;
-
-        for node in failed_schedule.new_node_processors.iter() {
-            if let Some(node_entry) = &mut self.nodes.get_mut(node.id.0) {
-                node_entry.processor_constructed = false;
-            }
+    pub(crate) fn on_schedule_send_failed(&mut self, mut failed_schedule: Box<ScheduleHeapData>) {
+        for node in failed_schedule.new_node_processors.drain(..) {
+            // Entries cannot move between compilation and its handoff while the context is borrowed.
+            let entry = self
+                .nodes
+                .get_mut(node.id.0)
+                .expect("validated schedule owner retained until handoff");
+            entry.construction = Construction::Staged(node);
         }
+    }
+
+    pub(crate) fn on_schedule_sent(
+        &mut self,
+        buffer_capacity: usize,
+        max_block_frames: NonZeroU32,
+    ) {
+        self.nodes_to_remove_from_schedule.clear();
+        self.prev_node_arena_capacity = self.nodes.capacity();
+        self.prev_buffer_capacity = buffer_capacity;
+        self.prev_max_block_frames = Some(max_block_frames);
+        self.needs_compile = false;
+    }
+
+    pub(crate) fn staged_processors(&mut self) -> impl Iterator<Item = &mut NodeHeapData> {
+        self.nodes
+            .iter_mut()
+            .map(|(_, entry)| entry)
+            .chain(
+                self.modify_guard_stack
+                    .iter_mut()
+                    .flat_map(|guard| guard.removed_nodes.iter_mut()),
+            )
+            .filter_map(|entry| match &mut entry.construction {
+                Construction::Staged(node) => Some(node),
+                _ => None,
+            })
+    }
+
+    pub(crate) fn owns_transferred(&self, id: NodeID) -> bool {
+        self.nodes
+            .iter()
+            .map(|(_, entry)| entry)
+            .chain(self.active_nodes_to_remove.values())
+            .chain(
+                self.modify_guard_stack
+                    .iter()
+                    .flat_map(|guard| guard.removed_nodes.iter()),
+            )
+            .any(|entry| entry.id == id && matches!(entry.construction, Construction::Transferred))
     }
 
     pub(crate) fn deactivate(&mut self) {
@@ -678,40 +724,48 @@ impl AudioGraph {
         &mut self,
         stream_info: &StreamInfo,
     ) -> Result<Box<ScheduleHeapData>, CompileGraphError> {
+        for (index, entry) in self.nodes.iter() {
+            if entry.id.0 != index {
+                return Err(CompileGraphError::NodeIDMismatch {
+                    node: entry.id,
+                    entry: NodeID(index),
+                });
+            }
+        }
         let schedule = self.compile_internal(stream_info.max_block_frames.get() as usize)?;
 
-        let buffer_capacity = schedule.buffer_capacity();
-
-        let mut new_node_processors = Vec::new();
         for (_, entry) in self.nodes.iter_mut() {
-            if !entry.processor_constructed {
-                entry.processor_constructed = true;
-
+            if matches!(entry.construction, Construction::Unconstructed) {
                 let cx = ConstructProcessorContext::new(
                     entry.id,
                     stream_info,
                     &mut entry.info.custom_state,
                 );
 
-                new_node_processors.push(NodeHeapData {
+                let processor = entry.dyn_node.construct_processor(cx).map_err(|error| {
+                    CompileGraphError::ProcessorConstructionFailed {
+                        node: entry.id,
+                        error,
+                    }
+                })?;
+                entry.construction = Construction::Staged(NodeHeapData {
                     id: entry.id,
-                    processor: entry
-                        .dyn_node
-                        .construct_processor(cx)
-                        .map_err(|node_error| {
-                            CompileGraphError::ProcessorConstructionFailed(node_error.to_string())
-                        })?,
+                    processor,
                     is_pre_process: entry.info.channel_config.is_empty(),
                     in_place_buffers: entry.info.in_place_buffers,
+                    needs_stream_update: false,
                 });
             }
         }
 
-        let mut nodes_to_remove = Vec::new();
-        core::mem::swap(
-            &mut self.nodes_to_remove_from_schedule,
-            &mut nodes_to_remove,
-        );
+        let mut new_node_processors = Vec::new();
+        for (_, entry) in self.nodes.iter_mut() {
+            match core::mem::replace(&mut entry.construction, Construction::Transferred) {
+                Construction::Staged(node) => new_node_processors.push(node),
+                other => entry.construction = other,
+            }
+        }
+        let nodes_to_remove = self.nodes_to_remove_from_schedule.clone();
 
         let (new_arena, new_profiler_heap_data) =
             if self.nodes.capacity() > self.prev_node_arena_capacity {
@@ -722,7 +776,6 @@ impl AudioGraph {
             } else {
                 (None, None)
             };
-        self.prev_node_arena_capacity = self.nodes.capacity();
 
         let schedule_data = Box::new(ScheduleHeapData::new(
             schedule,
@@ -731,9 +784,6 @@ impl AudioGraph {
             new_arena,
             new_profiler_heap_data,
         ));
-
-        self.needs_compile = false;
-        self.prev_buffer_capacity = buffer_capacity;
 
         #[cfg(feature = "tracing")]
         tracing::debug!("compiled new audio graph: {:?}", &schedule_data);
@@ -749,14 +799,21 @@ impl AudioGraph {
         max_block_frames: usize,
     ) -> Result<CompiledSchedule, CompileGraphError> {
         assert!(max_block_frames > 0);
-
+        let previous_capacity = if self
+            .prev_max_block_frames
+            .is_some_and(|frames| frames.get() as usize == max_block_frames)
+        {
+            self.prev_buffer_capacity
+        } else {
+            0
+        };
         compiler::compile(
             &mut self.nodes,
             &mut self.edges,
             self.graph_in_id,
             self.graph_out_id,
             max_block_frames,
-            self.prev_buffer_capacity,
+            previous_capacity,
         )
     }
 

@@ -1368,6 +1368,14 @@ fn err_callback(
 /// An error occurred while trying to start a CPAL audio stream.
 #[derive(Debug, thiserror::Error)]
 pub enum StartStreamError {
+    #[error("Processor {node:?} refused stream preparation: {error}")]
+    StreamPreparationFailed {
+        node: firewheel_core::node::NodeID,
+        #[source]
+        error: firewheel_core::node::NodeError,
+    },
+    #[error("The context to processor message channel is full")]
+    MsgChannelFull,
     /// The Firewheel context is already active. Either it has never been activated
     /// or the [`FirewheelProcessor`] counterpart has not been dropped yet.
     ///
@@ -1405,6 +1413,10 @@ impl From<ActivateError> for StartStreamError {
         match e {
             ActivateError::AlreadyActive => Self::AlreadyActive,
             ActivateError::GraphCompileError(e) => Self::GraphCompileError(e),
+            ActivateError::StreamPreparationFailed { node, error } => {
+                Self::StreamPreparationFailed { node, error }
+            }
+            ActivateError::MsgChannelFull => Self::MsgChannelFull,
         }
     }
 }
@@ -1424,4 +1436,92 @@ fn scratch_vec(len: usize) -> Vec<f32> {
     v.reserve_exact(len);
     v.resize(len, 0.0f32);
     v
+}
+
+#[cfg(test)]
+mod cold_errors {
+    use super::*;
+    use firewheel_core::node::{
+        AudioNode, AudioNodeInfo, AudioNodeProcessor, ConstructProcessorContext, EmptyConfig,
+        NodeError,
+    };
+
+    struct Node;
+    struct Processor;
+    impl AudioNodeProcessor for Processor {}
+    impl AudioNode for Node {
+        type Configuration = EmptyConfig;
+        fn info(&self, _: &EmptyConfig) -> Result<AudioNodeInfo, NodeError> {
+            Ok(AudioNodeInfo::new())
+        }
+        fn construct_processor(
+            &self,
+            _: &EmptyConfig,
+            _: ConstructProcessorContext,
+        ) -> Result<impl AudioNodeProcessor, NodeError> {
+            Ok(Processor)
+        }
+    }
+    #[derive(Debug, PartialEq)]
+    struct Payload(bool);
+    impl std::fmt::Display for Payload {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "controlled {}", self.0)
+        }
+    }
+    impl std::error::Error for Payload {}
+
+    fn original_payload<'a>(
+        mut error: &'a (dyn core::error::Error + 'static),
+    ) -> Option<&'a Payload> {
+        loop {
+            if let Some(payload) = error.downcast_ref::<Payload>() {
+                return Some(payload);
+            }
+            error = error.source()?;
+        }
+    }
+
+    #[test]
+    fn constructor_and_hook_errors_keep_the_full_node_and_original_payload() {
+        let mut context = FirewheelContext::new(Default::default());
+        let old = context.add_node(Node, None).unwrap();
+        context.remove_node(old).unwrap();
+        let current = context.add_node(Node, None).unwrap();
+        assert_eq!(old.0.slot(), current.0.slot());
+        assert_ne!(old, current);
+        for value in [false, true] {
+            let error = NodeError(Box::new(Payload(value)));
+            let converted = StartStreamError::from(ActivateError::GraphCompileError(
+                CompileGraphError::ProcessorConstructionFailed {
+                    node: current,
+                    error,
+                },
+            ));
+            assert_eq!(original_payload(&converted), Some(&Payload(value)));
+            let StartStreamError::GraphCompileError(
+                CompileGraphError::ProcessorConstructionFailed { node, error },
+            ) = converted
+            else {
+                panic!("typed constructor error")
+            };
+            assert_eq!(node, current);
+            assert_eq!(error.0.downcast_ref::<Payload>(), Some(&Payload(value)));
+            let error = NodeError(Box::new(Payload(value)));
+            let converted = StartStreamError::from(ActivateError::StreamPreparationFailed {
+                node: current,
+                error,
+            });
+            assert_eq!(original_payload(&converted), Some(&Payload(value)));
+            let StartStreamError::StreamPreparationFailed { node, error } = converted else {
+                panic!("typed hook error")
+            };
+            assert_eq!(node, current);
+            assert_eq!(error.0.downcast_ref::<Payload>(), Some(&Payload(value)));
+        }
+        assert!(matches!(
+            StartStreamError::from(ActivateError::MsgChannelFull),
+            StartStreamError::MsgChannelFull
+        ));
+    }
 }

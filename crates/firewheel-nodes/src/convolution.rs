@@ -163,11 +163,10 @@ impl AudioNode for ConvolutionNode {
 
         let did_init_first_impulse = if let Some(s) = &self.impulse_response {
             if s.len_frames() > max_frames as u64 {
-                return Err(ImpulseTooLongError {
+                return Err(NodeError::from_boxed(Box::new(ImpulseTooLongError {
                     got_len_seconds: s.len_frames() as f64 / cx.stream_info.sample_rate_recip,
                     max_len_seconds: config.max_impulse_length_seconds,
-                }
-                .into());
+                })));
             }
 
             if s.num_channels().get() < config.channels.get().get() as usize {

@@ -16,6 +16,9 @@ pub use context::{ActivateInfo, ContextQueue, FirewheelConfig, FirewheelContext,
 
 extern crate alloc;
 
+#[cfg(all(test, feature = "std"))]
+mod cold_tests;
+
 #[cfg(test)]
 mod tests {
     use crate::{backend::BackendProcessInfo, processor::FirewheelProcessor};

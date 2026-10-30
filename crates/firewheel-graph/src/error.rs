@@ -4,9 +4,6 @@ use firewheel_core::{
     node::{NodeError, NodeID},
 };
 
-#[cfg(not(feature = "std"))]
-use bevy_platform::prelude::String;
-
 /// An error occurred while attempting to add an edge to the graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AddEdgeError {
@@ -41,7 +38,7 @@ pub enum AddEdgeError {
 
 /// An error occurred while attempting to compile the audio graph
 /// into a schedule.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum CompileGraphError {
     /// A cycle was detected in the graph.
     #[error("Failed to compile audio graph: a cycle was detected")]
@@ -62,13 +59,23 @@ pub enum CompileGraphError {
     )]
     EdgeIDNotUnique(EdgeID),
     /// There was an error constructing the processor
-    #[error("Failed to construct a node's processor: {0}")]
-    ProcessorConstructionFailed(String),
+    #[error("Failed to construct processor {node:?}: {error}")]
+    ProcessorConstructionFailed {
+        node: NodeID,
+        #[source]
+        error: NodeError,
+    },
+    #[error("Node identity {node:?} does not match its owning entry {entry:?}")]
+    NodeIDMismatch { node: NodeID, entry: NodeID },
+    #[error("Block length {frames} exceeds the schedule flag limit {max}")]
+    BlockFramesOutOfRange { frames: u32, max: u32 },
+    #[error("No owning graph entry remains for processor {0:?}")]
+    ProcessorOwnerNotFound(NodeID),
 }
 
 /// An error occurred while attempting to activate a
 /// [`FirewheelContext`][crate::context::FirewheelContext].
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum ActivateError {
     /// The Firewheel context is already active. Either it has never been activated
     /// or the [`FirewheelProcessor`][crate::processor::FirewheelProcessor] counterpart
@@ -82,10 +89,18 @@ pub enum ActivateError {
     /// The audio graph failed to compile.
     #[error("Failed to activate Firewheel context: Audio graph failed to compile: {0}")]
     GraphCompileError(#[from] CompileGraphError),
+    #[error("Processor {node:?} refused stream preparation: {error}")]
+    StreamPreparationFailed {
+        node: NodeID,
+        #[source]
+        error: NodeError,
+    },
+    #[error("The context to processor message channel is full")]
+    MsgChannelFull,
 }
 
 /// An error occurred while updating a [`FirewheelContext`][crate::context::FirewheelContext].
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum UpdateError {
     /// The context to processor message channel is full.
     #[error("The Firewheel context to processor message channel is full")]
@@ -117,7 +132,7 @@ pub enum DeactivateError {
 pub enum ModifyGraphError {
     /// An error occured while adding a new node to the graph.
     #[error("{0}")]
-    NodeError(NodeError),
+    NodeError(#[source] NodeError),
     #[error("{0}")]
     /// An error occured while removing a node from the graph.
     RemoveNodeError(#[from] RemoveNodeError),

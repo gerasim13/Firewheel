@@ -13,13 +13,19 @@ mod schedule;
 pub(crate) use schedule::{CompiledSchedule, NodeHeapData, ProcessNodeInfo, ScheduleHeapData};
 use schedule::{InBufferAssignment, OutBufferAssignment, PreProcNode, ScheduledNode};
 
+pub(super) enum Construction {
+    Unconstructed,
+    Staged(NodeHeapData),
+    Transferred,
+}
+
 pub struct NodeEntry {
     pub id: NodeID,
     pub info: AudioNodeInfoInner,
     /// In order to be compatible with nodes hosting CLAP plugins,
     /// this field must remain !Send
     pub dyn_node: Box<dyn DynAudioNode>,
-    pub processor_constructed: bool,
+    pub(super) construction: Construction,
     /// The edges connected to this node's input ports.
     incoming: SmallVec<[Edge; 4]>,
     /// The edges connected to this node's output ports.
@@ -36,10 +42,20 @@ impl NodeEntry {
             id: NodeID::DANGLING,
             info,
             dyn_node,
-            processor_constructed: false,
+            construction: Construction::Unconstructed,
             incoming: SmallVec::new(),
             outgoing: SmallVec::new(),
         }
+    }
+}
+
+impl Drop for NodeEntry {
+    fn drop(&mut self) {
+        drop(core::mem::replace(
+            &mut self.construction,
+            Construction::Unconstructed,
+        ));
+        firewheel_core::collector::GlobalRtGc::collect();
     }
 }
 

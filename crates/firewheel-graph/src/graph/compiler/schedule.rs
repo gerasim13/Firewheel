@@ -177,6 +177,7 @@ pub(crate) struct NodeHeapData {
     pub processor: Box<dyn AudioNodeProcessor>,
     pub is_pre_process: bool,
     pub in_place_buffers: bool,
+    pub needs_stream_update: bool,
 }
 
 pub struct ScheduleHeapData {
@@ -252,6 +253,14 @@ pub struct CompiledSchedule {
 
     max_block_frames: usize,
     graph_in_node_id: NodeID,
+    prepared_geometry: Option<PreparedGeometry>,
+}
+
+struct PreparedGeometry {
+    buffers: Vec<f32>,
+    flags: Vec<BufferFlags>,
+    bypass: SequentialBuffer<f32>,
+    frames: usize,
 }
 
 impl Debug for CompiledSchedule {
@@ -337,7 +346,49 @@ impl CompiledSchedule {
             graph_in_node_id,
             reuse_buffer_allocation,
             buffer_capacity,
+            prepared_geometry: None,
         }
+    }
+
+    pub(crate) fn prepare_geometry(&mut self, frames: usize, preceding_geometry: Option<usize>) {
+        self.prepared_geometry = None;
+        if self.max_block_frames != frames
+            || (self.reuse_buffer_allocation && preceding_geometry != Some(frames))
+        {
+            self.prepared_geometry = Some(PreparedGeometry {
+                buffers: vec![0.0; frames * self.num_buffers],
+                flags: vec![
+                    BufferFlags {
+                        silent: true,
+                        constant: true,
+                        frames: frames as u16
+                    };
+                    self.num_buffers
+                ],
+                bypass: SequentialBuffer::new(self.bypass_declick_buffer.num_channels(), frames),
+                frames,
+            });
+        }
+    }
+
+    pub(crate) fn apply_prepared_geometry(&mut self) {
+        if let Some(prepared) = self.prepared_geometry.take() {
+            self.buffer_capacity =
+                (prepared.buffers.capacity() / prepared.frames).min(prepared.flags.capacity());
+            self.buffers = prepared.buffers;
+            self.buffer_flags = prepared.flags;
+            self.bypass_declick_buffer = prepared.bypass;
+            self.max_block_frames = prepared.frames;
+            self.reuse_buffer_allocation = false;
+        }
+    }
+
+    pub(crate) fn prepared_buffer_capacity(&self) -> usize {
+        self.prepared_geometry
+            .as_ref()
+            .map_or(self.buffer_capacity, |prepared| {
+                (prepared.buffers.capacity() / prepared.frames).min(prepared.flags.capacity())
+            })
     }
 
     pub(crate) fn sync_new_buffers(&mut self, old_schedule: &mut CompiledSchedule) {

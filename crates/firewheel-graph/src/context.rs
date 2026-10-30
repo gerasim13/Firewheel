@@ -1,3 +1,4 @@
+use bevy_platform::collections::HashSet;
 use bevy_platform::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -7,7 +8,7 @@ use core::error::Error;
 use core::num::NonZeroU32;
 use core::time::Duration;
 use core::{any::Any, f64};
-use firewheel_core::node::{NodeError, ProcStore};
+use firewheel_core::node::{NodeError, ProcStore, ProcStreamCtx};
 use firewheel_core::{
     StreamInfo,
     channel_config::{ChannelConfig, ChannelCount},
@@ -41,10 +42,11 @@ use crate::{
         ActivateError, AddEdgeError, CompileGraphError, DeactivateError, RemoveNodeError,
         UpdateError,
     },
-    graph::{AudioGraph, Edge, EdgeID, NodeEntry, PortIdx},
+    graph::{AudioGraph, Edge, EdgeID, NodeEntry, PortIdx, ScheduleHeapData},
     processor::{
         BufferOutOfSpaceMode, ContextToProcessorMsg, FirewheelProcessor, FirewheelProcessorConfig,
         FirewheelProcessorInner, ProcessorToContextMsg, ProfilingData, SharedClock, SharedFlags,
+        prepare_queue, prepare_schedule,
         profiling::{ProfilerRx, ProfilerTx},
     },
 };
@@ -461,90 +463,144 @@ impl FirewheelContext {
     /// its contents, this may never succeed. Consider adding a timeout to avoid
     /// deadlocking.
     pub fn activate(&mut self, info: ActivateInfo) -> Result<FirewheelProcessor, ActivateError> {
-        let ActivateInfo {
-            sample_rate,
-            max_block_frames,
-            num_stream_in_channels,
-            num_stream_out_channels,
-            input_to_output_latency_seconds,
-        } = info;
-
         if self.is_active() {
             return Err(ActivateError::AlreadyActive);
         }
-
-        let maybe_proc_channel = self.pending_processor_channel.take();
-
-        let prev_sample_rate = if maybe_proc_channel.is_some() {
-            sample_rate
-        } else {
-            self.sample_rate
-        };
-
+        if info.max_block_frames.get() > u32::from(u16::MAX) {
+            return Err(CompileGraphError::BlockFramesOutOfRange {
+                frames: info.max_block_frames.get(),
+                max: u32::from(u16::MAX),
+            }
+            .into());
+        }
         let stream_info = StreamInfo {
-            sample_rate,
-            sample_rate_recip: (sample_rate.get() as f64).recip(),
-            prev_sample_rate,
-            max_block_frames,
-            num_stream_in_channels,
-            num_stream_out_channels,
-            input_to_output_latency_seconds,
+            sample_rate: info.sample_rate,
+            sample_rate_recip: (info.sample_rate.get() as f64).recip(),
+            prev_sample_rate: if self.pending_processor_channel.is_some() {
+                info.sample_rate
+            } else {
+                self.sample_rate
+            },
+            max_block_frames: info.max_block_frames,
+            num_stream_in_channels: info.num_stream_in_channels,
+            num_stream_out_channels: info.num_stream_out_channels,
+            input_to_output_latency_seconds: info.input_to_output_latency_seconds,
             declick_frames: NonZeroU32::new(
-                (self.config.declick_seconds * sample_rate.get() as f32).round() as u32,
+                (self.config.declick_seconds * info.sample_rate.get() as f32).round() as u32,
             )
             .unwrap_or(NonZeroU32::MIN),
         };
-
-        self.sample_rate = stream_info.sample_rate;
-        self.sample_rate_recip = stream_info.sample_rate_recip;
-
-        let schedule = self.graph.compile(&stream_info)?;
-
+        for node in self.graph.staged_processors() {
+            node.needs_stream_update = true;
+        }
+        let mut schedule = self.graph.compile(&stream_info)?;
+        if let Err(error) = self.prepare_activation(&mut schedule, &stream_info) {
+            self.graph.on_schedule_send_failed(schedule);
+            return Err(error);
+        }
+        let config = FirewheelProcessorConfig {
+            flags: self.config.flags.into(),
+            immediate_event_buffer_capacity: self.config.immediate_event_capacity,
+            buffer_out_of_space_mode: self.config.buffer_out_of_space_mode,
+            clamp_graph_inputs_below_amp: self.config.clamp_graph_inputs_below.map(|v| v.amp()),
+            node_event_buffer_capacity: self.config.event_queue_capacity,
+            #[cfg(feature = "scheduled_events")]
+            scheduled_event_buffer_capacity: self.config.scheduled_event_capacity,
+        };
+        let mut initial = self
+            .pending_processor_channel
+            .as_ref()
+            .map(|_| FirewheelProcessorInner::prepare_initial(&config, &stream_info));
         let (drop_tx, drop_rx) = ringbuf::HeapRb::<FirewheelProcessorInner>::new(1).split();
-
-        let processor = if let Some(proc_channel) = maybe_proc_channel {
+        let drop_flag = Arc::new(AtomicBool::new(false));
+        let buffer_capacity = schedule.schedule.prepared_buffer_capacity();
+        if let Err((message, _)) =
+            self.send_message_to_processor(ContextToProcessorMsg::NewSchedule(schedule))
+        {
+            // try_push returns exactly the owning message supplied above.
+            let ContextToProcessorMsg::NewSchedule(schedule) = message else {
+                unreachable!()
+            };
+            self.graph.on_schedule_send_failed(schedule);
+            return Err(ActivateError::MsgChannelFull);
+        }
+        let mut processor = if let Some(channel) = self.pending_processor_channel.take() {
             FirewheelProcessorInner::new(
-                FirewheelProcessorConfig {
-                    flags: self.config.flags.into(),
-                    immediate_event_buffer_capacity: self.config.immediate_event_capacity,
-                    buffer_out_of_space_mode: self.config.buffer_out_of_space_mode,
-                    clamp_graph_inputs_below_amp: self
-                        .config
-                        .clamp_graph_inputs_below
-                        .map(|v| v.amp()),
-                    node_event_buffer_capacity: self.config.event_queue_capacity,
-                    #[cfg(feature = "scheduled_events")]
-                    scheduled_event_buffer_capacity: self.config.scheduled_event_capacity,
-                },
-                proc_channel,
+                config,
+                channel,
                 &stream_info,
+                initial
+                    .take()
+                    .expect("initial resources prepared before handoff"),
             )
         } else {
-            let mut processor = self.processor_drop_rx.as_mut().unwrap().try_pop().unwrap();
+            // Preflight borrowed this same return slot; no callback or consumer runs here.
+            self.processor_drop_rx
+                .as_mut()
+                .and_then(|rx| rx.try_pop())
+                .expect("exclusive inactive owner retained until handoff")
+        };
+        processor.new_stream(&stream_info);
+        for node in self.graph.staged_processors() {
+            if node.needs_stream_update {
+                node.processor.new_stream(
+                    &stream_info,
+                    &mut ProcStreamCtx {
+                        store: &mut processor.extra.store,
+                        logger: &mut processor.extra.logger,
+                    },
+                );
+                node.needs_stream_update = false;
+            }
+        }
+        self.graph
+            .on_schedule_sent(buffer_capacity, stream_info.max_block_frames);
+        self.sample_rate = stream_info.sample_rate;
+        self.sample_rate_recip = stream_info.sample_rate_recip;
+        self.processor_drop_rx = Some(drop_rx);
+        self.stream_info = Some(stream_info);
+        self.processor_drop_flag = Some(drop_flag.clone());
+        Ok(FirewheelProcessor::new(processor, drop_tx, drop_flag))
+    }
 
+    fn prepare_activation(
+        &mut self,
+        schedule: &mut ScheduleHeapData,
+        info: &StreamInfo,
+    ) -> Result<(), ActivateError> {
+        let mut seen = HashSet::default();
+        let preceding = if let Some(channel) = &mut self.pending_processor_channel {
+            prepare_queue(
+                &mut channel.from_context_rx,
+                info,
+                None,
+                &mut seen,
+                &self.graph,
+            )?
+        } else if let Some(processor) = self.processor_drop_rx.as_mut().and_then(|rx| rx.last_mut())
+        {
             if processor.poisoned {
                 panic!("The audio thread has panicked!");
             }
-
-            processor.new_stream(&stream_info);
-
-            processor
+            processor.prepare_stream(info, &mut seen, &self.graph)?
+        } else {
+            return Err(ActivateError::AlreadyActive);
         };
-
-        if self
-            .send_message_to_processor(ContextToProcessorMsg::NewSchedule(schedule))
-            .is_err()
-        {
-            panic!("Firewheel message channel is full!");
+        prepare_schedule(schedule, info, preceding, &mut seen, &self.graph)?;
+        for node in self.graph.staged_processors() {
+            if !seen.insert(node.id) {
+                return Err(CompileGraphError::NodeIDNotUnique(node.id).into());
+            }
+            if node.needs_stream_update {
+                node.processor.prepare_new_stream(info).map_err(|error| {
+                    ActivateError::StreamPreparationFailed {
+                        node: node.id,
+                        error,
+                    }
+                })?;
+            }
         }
-
-        self.processor_drop_rx = Some(drop_rx);
-        self.stream_info = Some(stream_info);
-
-        let drop_flag = Arc::new(AtomicBool::new(false));
-        self.processor_drop_flag = Some(drop_flag.clone());
-
-        Ok(FirewheelProcessor::new(processor, drop_tx, drop_flag))
+        Ok(())
     }
 
     /// Request the context to be deactivated if it is active.
@@ -868,6 +924,7 @@ impl FirewheelContext {
         if self.is_active() {
             if self.graph.needs_compile() {
                 let schedule_data = self.graph.compile(self.stream_info.as_ref().unwrap())?;
+                let buffer_capacity = schedule_data.schedule.buffer_capacity();
 
                 if let Err((msg, e)) = self
                     .send_message_to_processor(ContextToProcessorMsg::NewSchedule(schedule_data))
@@ -880,6 +937,10 @@ impl FirewheelContext {
 
                     return Err(e);
                 }
+                self.graph.on_schedule_sent(
+                    buffer_capacity,
+                    self.stream_info.as_ref().unwrap().max_block_frames,
+                );
             }
 
             #[cfg(feature = "scheduled_events")]
@@ -1398,7 +1459,13 @@ impl Drop for FirewheelContext {
 
         // Make sure all node processors are dropped before node states in
         // order to be compatible with CLAP plugin hosting.
+        if let Some(channel) = &mut self.pending_processor_channel {
+            channel.from_context_rx.clear();
+        }
         if let Some(p) = &mut self.processor_drop_rx {
+            if let Some(processor) = p.last_mut() {
+                processor.clear_pending_owners();
+            }
             p.clear();
         }
         self.from_processor_rx.clear();
@@ -1470,3 +1537,6 @@ pub enum ClearScheduledEventsType {
     /// Clear only musical scheduled events.
     MusicalOnly,
 }
+
+#[cfg(all(test, feature = "std"))]
+mod cold_tests;
